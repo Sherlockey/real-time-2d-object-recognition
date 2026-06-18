@@ -1,0 +1,14 @@
+[
+  {
+    "label": "configure",
+    "command": "cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_TOOLCHAIN_FILE=C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake",
+  },
+  {
+    "label": "build",
+    "command": "cmake --build build",
+  },
+  {
+    "label": "run",
+    "command": "./build/debug/main.exe",
+  },
+]
