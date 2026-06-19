@@ -84,6 +84,20 @@ int compute_threshold(const cv::Mat& src, int sample_divisor = 16, int K = 2,
 }
 
 /*
+    Clean up a binary image with morphological filtering.
+    Close (dilate then erode) to fill small holes inside objects;
+
+    @param src input binary image, CV_8UC1
+    @param dst output cleaned binary image, CV_8UC1
+*/
+void clean_up(const cv::Mat& src, cv::Mat& dst)
+{
+    // Fill holes inside the objects.
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+    cv::morphologyEx(src, dst, cv::MORPH_CLOSE, kernel);
+}
+
+/*
     Program entry point
 
     @param argc argument count with how many command line arguments provided
@@ -108,6 +122,9 @@ int main(int argc, char* argv[])
     cv::namedWindow("Thresholded Video", 1);
     cv::moveWindow("Thresholded Video", original_rect.width, 0);
 
+    cv::namedWindow("Cleaned Video", 1);
+    cv::moveWindow("Cleaned Video", original_rect.width * 2, 0);
+
     cv::Mat frame;
 
     // main loop
@@ -130,9 +147,14 @@ int main(int argc, char* argv[])
         cv::Mat thresholded;
         cv::threshold(processed, thresholded, threshold, 255, cv::THRESH_BINARY_INV);
 
+        // clean up via morphological filtering
+        cv::Mat cleaned;
+        clean_up(thresholded, cleaned);
+
         // display
         cv::imshow("Original Video", frame);
         cv::imshow("Thresholded Video", thresholded);
+        cv::imshow("Cleaned Video", cleaned);
 
         // handle input
         char key = cv::pollKey();
