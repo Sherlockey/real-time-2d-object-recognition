@@ -7,6 +7,7 @@
 
 #include "k_means.hpp"
 #include <opencv2/opencv.hpp>
+#include <opencv2/videoio.hpp>
 
 /*
     Pre-process a BGR frame into a single-channel image suited for thresholding.
@@ -98,6 +99,121 @@ void clean_up(const cv::Mat& src, cv::Mat& dst)
 }
 
 /*
+    Run connected components, filter small regions, keep the largest N,
+    and renumber survivors sequentially (1..M) in a fresh label map.
+
+    @param src input binary image, CV_8UC1 (objects = 255)
+    @param out_labels output CV_32S map, survivors renumbered 1..M, else 0
+    @param out_stats stats rows for survivors, in new-ID order (index 0 = region 1)
+    @param out_centroids centroid (x,y) for survivors, in new-ID order
+    @param min_area regions below this area are discarded
+    @param max_regions keep only the N largest
+    @return number of regions kept, M
+*/
+int segment(const cv::Mat& src, cv::Mat& out_labels, std::vector<cv::Vec3i>& out_stats,
+            std::vector<cv::Point2d>& out_centroids, int min_area, int max_regions)
+{
+    // get connected components with stats from src image
+    cv::Mat labels, stats, centroids;
+    int n = cv::connectedComponentsWithStats(src, labels, stats, centroids);
+
+    // filter by size (skipping background)
+    std::vector<std::pair<int, int>> kept; // <area, original_label>
+    for (int label = 1; label < n; label++)
+    {
+        int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        if (area >= min_area)
+        {
+            kept.push_back({area, label});
+        }
+    }
+
+    // sort in descending order
+    std::sort(kept.begin(), kept.end(), std::greater<std::pair<int, int>>());
+    if (max_regions > 0 && kept.size() > max_regions)
+    {
+        kept.resize(max_regions);
+    }
+
+    // build out_stats and out_centroids
+    // map original label -> new sequential ID (1..M), background still = (0)
+    std::vector<int> remap(n, 0); // <original, new_id>
+    out_stats.clear();
+    out_centroids.clear();
+    for (int i = 0; i < kept.size(); i++)
+    {
+        int orig = kept[i].second;
+        int new_id = i + 1;
+        remap[orig] = new_id;
+        out_stats.push_back(cv::Vec3i(stats.at<int>(orig, cv::CC_STAT_AREA),
+                                      stats.at<int>(orig, cv::CC_STAT_LEFT),
+                                      stats.at<int>(orig, cv::CC_STAT_TOP)));
+        out_centroids.push_back(
+            cv::Point2d(centroids.at<double>(orig, 0), centroids.at<double>(orig, 1)));
+    }
+
+    // build the renumbered label map
+    out_labels.create(labels.size(), CV_32S);
+    for (int i = 0; i < labels.rows; i++)
+    {
+        const int* src_row = labels.ptr<int>(i);
+        int* dst_row = out_labels.ptr<int>(i);
+        for (int j = 0; j < labels.cols; j++)
+        {
+            dst_row[j] = remap[src_row[j]];
+        }
+    }
+
+    return static_cast<int>(kept.size());
+}
+
+/*
+    Color a renumbered label map for display using evenly-spaced hues.
+    Region 0 (background) is black; regions 1..M get hues spread evenly
+    around the color wheel based on max_regions at full saturation and value.
+
+    @param labels CV_32S label map with IDs 0..M
+    @param dst output BGR image, CV_8UC3
+    @param max_regions maximum number of regions, should match segment's max_regions
+*/
+void color_regions(const cv::Mat& labels, cv::Mat& dst, int max_regions)
+{
+    // build palette: index 0 = background (black), 1..M = evenly-spaced hues
+    std::vector<cv::Vec3b> palette(max_regions + 1, cv::Vec3b(0, 0, 0));
+    if (max_regions > 0)
+    {
+        cv::Mat hsv(1, max_regions, CV_8UC3);
+        for (int i = 0; i < max_regions; i++)
+        {
+            // OpenCV hue range is 0..179
+            uchar hue = static_cast<uchar>((i * 180) / max_regions);
+            hsv.at<cv::Vec3b>(0, i) = cv::Vec3b(hue, 255, 255);
+        }
+
+        cv::Mat bgr;
+        cv::cvtColor(hsv, bgr, cv::COLOR_HSV2BGR);
+
+        for (int i = 0; i < max_regions; i++)
+        {
+            palette[i + 1] = bgr.at<cv::Vec3b>(0, i);
+        }
+    }
+
+    // apply the palette to dst
+    dst.create(labels.size(), CV_8UC3);
+    for (int r = 0; r < labels.rows; r++)
+    {
+        const int* l_row = labels.ptr<int>(r);
+        cv::Vec3b* d_row = dst.ptr<cv::Vec3b>(r);
+        for (int c = 0; c < labels.cols; c++)
+        {
+            int id = l_row[c];
+            d_row[c] = (id >= 0 && id <= max_regions) ? palette[id] : cv::Vec3b(0, 0, 0);
+        }
+    }
+}
+
+/*
     Program entry point
 
     @param argc argument count with how many command line arguments provided
@@ -125,6 +241,13 @@ int main(int argc, char* argv[])
     cv::namedWindow("Cleaned Video", 1);
     cv::moveWindow("Cleaned Video", original_rect.width * 2, 0);
 
+    cv::namedWindow("Region Map", 1);
+    cv::moveWindow("Region Map", original_rect.width * 3, 0);
+
+    const int min_region_area =
+        static_cast<int>(0.0025 * video_capture.get(cv::CAP_PROP_FRAME_WIDTH) *
+                         video_capture.get(cv::CAP_PROP_FRAME_HEIGHT));
+
     cv::Mat frame;
 
     // main loop
@@ -151,10 +274,22 @@ int main(int argc, char* argv[])
         cv::Mat cleaned;
         clean_up(thresholded, cleaned);
 
+        // segment the image into regions and color them
+        cv::Mat region_labels;
+        std::vector<cv::Vec3i> region_stats;
+        std::vector<cv::Point2d> region_centroids;
+        const int max_regions = 5;
+        int num_regions = segment(cleaned, region_labels, region_stats, region_centroids,
+                                  min_region_area, max_regions);
+
+        cv::Mat region_map;
+        color_regions(region_labels, region_map, max_regions);
+
         // display
         cv::imshow("Original Video", frame);
         cv::imshow("Thresholded Video", thresholded);
         cv::imshow("Cleaned Video", cleaned);
+        cv::imshow("Region Map", region_map);
 
         // handle input
         char key = cv::pollKey();
