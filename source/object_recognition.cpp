@@ -550,6 +550,85 @@ std::string classify(const std::vector<double>& feature_vector,
 }
 
 /*
+    Accumulates (true_label, predicted_label) pairs into a confusion matrix.
+*/
+struct ConfusionMatrix
+{
+    // counts[true_label][predicted_label] = number of times that pair occurred
+    std::map<std::string, std::map<std::string, int>> counts;
+    std::set<std::string> labels; // every label seen, for consistent ordering
+
+    void record(const std::string& true_label, const std::string& predicted)
+    {
+        counts[true_label][predicted]++;
+        labels.insert(true_label);
+        labels.insert(predicted);
+    }
+};
+
+/*
+    Print a confusion matrix as a grid: rows = true label, columns = predicted.
+
+    @param cm  the accumulated confusion matrix
+*/
+void print_confusion_matrix(const ConfusionMatrix& cm)
+{
+    std::vector<std::string> labels(cm.labels.begin(), cm.labels.end());
+
+    const int w = 12; // column width
+
+    // Header row.
+    std::cout << "\n" << std::setw(w) << "true\\pred";
+    for (const auto& p : labels)
+    {
+        std::cout << std::setw(w) << p;
+    }
+    std::cout << "\n";
+
+    // One row per true label.
+    for (const auto& t : labels)
+    {
+        std::cout << std::setw(w) << t;
+        for (const auto& p : labels)
+        {
+            int count = 0;
+            auto row = cm.counts.find(t);
+            if (row != cm.counts.end())
+            {
+                auto cell = row->second.find(p);
+                if (cell != row->second.end())
+                    count = cell->second;
+            }
+            std::cout << std::setw(w) << count;
+        }
+        std::cout << "\n";
+    }
+
+    // Overall accuracy.
+    int correct = 0, total = 0;
+    for (const auto& t : labels)
+    {
+        auto row = cm.counts.find(t);
+        if (row == cm.counts.end())
+            continue;
+        for (const auto& p : labels)
+        {
+            auto cell = row->second.find(p);
+            if (cell == row->second.end())
+                continue;
+            total += cell->second;
+            if (t == p)
+                correct += cell->second;
+        }
+    }
+    if (total > 0)
+    {
+        std::cout << "\naccuracy: " << correct << "/" << total << " = " << std::fixed
+                  << std::setprecision(3) << (100.0 * correct / total) << "%\n";
+    }
+}
+
+/*
     Program entry point.
 
     @param argc argument count with how many command line arguments provided
@@ -589,6 +668,8 @@ int main(int argc, char* argv[])
 
     std::vector<TrainingExample> training_db = load_training_examples("data/object_db.csv");
     std::vector<double> feature_std_devs = compute_feature_std_devs(training_db);
+
+    ConfusionMatrix confusion_matrix;
 
     cv::Mat frame;
 
@@ -726,6 +807,33 @@ int main(int argc, char* argv[])
                 training_db = load_training_examples("data/object_db.csv");
                 feature_std_devs = compute_feature_std_devs(training_db);
             }
+        }
+        if (key == 'e') // evaluate: record (true, predicted) for the confusion matrix
+        {
+            if (frame_features.size() != 1)
+            {
+                std::cout << "Evaluation needs exactly one region in view (found "
+                          << frame_features.size() << ").\n";
+            }
+            else
+            {
+                std::cout << "Enter TRUE label for this object: ";
+                std::string true_label;
+                std::getline(std::cin, true_label);
+
+                if (!true_label.empty())
+                {
+                    std::vector<double> fv = make_feature_vector(frame_features[0]);
+                    std::string predicted = classify(fv, training_db, feature_std_devs, 3.0);
+                    confusion_matrix.record(true_label, predicted);
+                    std::cout << "true=" << true_label << "  predicted=" << predicted
+                              << (true_label == predicted ? "  [correct]" : "  [WRONG]") << "\n";
+                }
+            }
+        }
+        if (key == 'm') // print the confusion matrix
+        {
+            print_confusion_matrix(confusion_matrix);
         }
     }
 
