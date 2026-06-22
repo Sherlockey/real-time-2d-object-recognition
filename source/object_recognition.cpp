@@ -526,7 +526,7 @@ std::vector<double> compute_feature_std_devs(const std::vector<TrainingExample>&
 */
 std::string classify(const std::vector<double>& feature_vector,
                      const std::vector<TrainingExample>& training_examples,
-                     const std::vector<double>& std_devs, const double unknown_treshold = 3.0)
+                     const std::vector<double>& std_devs, const double unknown_treshold = 0.4)
 {
     std::string result = "";
     double closest_distance = std::numeric_limits<double>::max();
@@ -682,6 +682,7 @@ int main(int argc, char* argv[])
     std::vector<double> feature_std_devs = compute_feature_std_devs(training_db);
 
     ConfusionMatrix confusion_matrix;
+    const double unknown_threshold = 0.4;
 
     cv::Mat frame;
 
@@ -726,7 +727,7 @@ int main(int argc, char* argv[])
         std::vector<RegionFeatures> frame_features;     // this frame's RegionFeatures
 
         // feature loop
-        for (int i = 1; i < num_regions; i++) // start at 1 to skip background
+        for (int i = 0; i < num_regions; i++)
         {
             RegionFeatures region_features;
             if (compute_features(region_labels, i + 1, region_features))
@@ -738,7 +739,6 @@ int main(int argc, char* argv[])
                 frame_vectors.push_back(feature_vector);
 
                 // classify
-                const double unknown_threshold = 3.0;
                 std::string classification_label =
                     classify(feature_vector, training_db, feature_std_devs, unknown_threshold);
 
@@ -836,7 +836,8 @@ int main(int argc, char* argv[])
                 if (!true_label.empty())
                 {
                     std::vector<double> fv = make_feature_vector(frame_features[0]);
-                    std::string predicted = classify(fv, training_db, feature_std_devs, 3.0);
+                    std::string predicted =
+                        classify(fv, training_db, feature_std_devs, unknown_threshold);
                     confusion_matrix.record(true_label, predicted);
                     std::cout << "true=" << true_label << "  predicted=" << predicted
                               << (true_label == predicted ? "  [correct]" : "  [WRONG]") << "\n";
