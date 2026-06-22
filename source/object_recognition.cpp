@@ -6,6 +6,7 @@
 */
 
 #include "k_means.hpp"
+#include <fstream>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
@@ -376,14 +377,89 @@ std::string format_feature_vector(const std::vector<double>& fv)
     return oss.str();
 }
 
+struct TrainingExample
+{
+    std::string label;
+    std::vector<double> features;
+};
+
 /*
-    Program entry point
+    Append a labeled feature vector to the database file (CSV).
+    Writes a header row if the file is new or empty.
+
+    @param path path to the CSV database
+    @param label object label
+    @param rf features to store
+*/
+void save_training_example(const std::string& path, const std::string& label,
+                           const RegionFeatures& rf)
+{
+    std::ifstream check(path);
+    bool empty = check.peek() == std::ifstream::traits_type::eof();
+    check.close();
+
+    std::ofstream file(path, std::ios::app);
+    if (!file)
+    {
+        std::cout << "Could not open DB file for writing: " << path << "\n";
+        return;
+    }
+
+    if (empty)
+    {
+        file << "label,percent_filled,aspect_ratio\n";
+    }
+
+    file << label << "," << rf.percent_filled << "," << rf.aspect_ratio << "\n";
+}
+
+/*
+    Loads the training examples from the given path and saves them in a vector.
+
+    @param path path to the CSV database
+    @return a vector containing all the training examples from the CSV
+*/
+std::vector<TrainingExample> load_training_examples(const std::string& path)
+{
+    std::vector<TrainingExample> result;
+    std::ifstream file(path);
+    std::string line;
+    bool first = true;
+    while (std::getline(file, line))
+    {
+        if (first) // skip header
+        {
+            first = false;
+            continue;
+        }
+
+        if (line.empty())
+        {
+            continue;
+        }
+
+        TrainingExample te;
+        std::stringstream ss(line);
+        std::string token;
+        std::getline(ss, te.label, ',');
+        while (std::getline(ss, token, ','))
+        {
+            te.features.push_back(std::stod(token));
+        }
+        result.push_back(te);
+    }
+    return result;
+}
+
+/*
+    Program entry point.
 
     @param argc argument count with how many command line arguments provided
     @param argv argument vector is an array of strings with command line args
     @return exit status / return code sent back to OS
 */
 int main(int argc, char* argv[])
+
 {
     // open video device
     cv::VideoCapture video_capture(0);
@@ -453,27 +529,33 @@ int main(int argc, char* argv[])
 
         cv::Mat features = frame.clone();
         std::vector<std::vector<double>> frame_vectors; // this frame's vectors
-        for (int i = 1; i < num_regions; i++)
+        std::vector<RegionFeatures> frame_features;     // this frame's RegionFeatures
+
+        for (int i = 1; i < num_regions; i++) // start at 1 to skip background
         {
             RegionFeatures f;
             if (compute_features(region_labels, i + 1, f))
             {
                 draw_features(features, f);
+                frame_features.push_back(f);
 
-                // make feature vectors
                 std::vector<double> feature_vector = make_feature_vector(f);
                 frame_vectors.push_back(feature_vector);
 
                 // display text
+                std::string id_text = "ID: " + std::to_string(i);
+                cv::putText(features, id_text, cv::Point((int)f.centroid.x + 10, (int)f.centroid.y),
+                            cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+
                 std::string title = "percent_filled, aspect_ratio";
                 cv::putText(features, title,
-                            cv::Point((int)f.centroid.x - 10, (int)f.centroid.y - 10),
-                            cv::FONT_HERSHEY_COMPLEX, 0.45, cv::Scalar(255, 255, 255), 1);
+                            cv::Point((int)f.centroid.x + 10, (int)f.centroid.y + 18),
+                            cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
 
                 std::string values = format_feature_vector(feature_vector);
                 cv::putText(features, values,
-                            cv::Point((int)f.centroid.x + 10, (int)f.centroid.y + 10),
-                            cv::FONT_HERSHEY_COMPLEX, 0.45, cv::Scalar(255, 255, 255), 1);
+                            cv::Point((int)f.centroid.x + 10, (int)f.centroid.y + 36),
+                            cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
             }
         }
 
@@ -486,7 +568,7 @@ int main(int argc, char* argv[])
 
         // handle input
         char key = cv::pollKey();
-        if (key == 'q' || key == 27) // 27 = escape
+        if (key == 'q' || key == 27) // 27 = escape. quit program
         {
             should_quit = true;
         }
@@ -497,6 +579,30 @@ int main(int argc, char* argv[])
             {
                 std::cout << "    region " << (i + 1) << ": "
                           << format_feature_vector(frame_vectors[i]) << "\n";
+            }
+        }
+        if (key == 'n') // save training examples
+        {
+            if (frame_features.empty())
+            {
+                std::cout << "No regions to label.\n";
+            }
+            for (int i = 0; i < frame_features.size(); i++)
+            {
+                std::cout << "Enter label for region " << (i + 1) << " (blank to skip): ";
+                std::string label;
+                std::getline(std::cin, label);
+
+                if (label.empty())
+                {
+                    std::cout << "Skipped region " << (i + 1) << ".\n";
+                    continue;
+                }
+
+                save_training_example("data/object_db.csv", label, frame_features[i]);
+                std::cout << "Saved '" << label
+                          << "': " << format_feature_vector(make_feature_vector(frame_features[i]))
+                          << "\n";
             }
         }
     }
