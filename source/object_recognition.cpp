@@ -7,6 +7,7 @@
 
 #include "k_means.hpp"
 #include <fstream>
+#include <limits>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
@@ -255,8 +256,12 @@ bool compute_features(const cv::Mat& labels, int region_id, RegionFeatures& out)
     double cos = std::cos(out.angle);
     double sin = std::sin(out.angle);
 
-    double min_proj = 1e18, max_proj = -1e18; // along the axis
-    double min_perp = 1e18, max_perp = -1e18; // perpendicular to it
+    // along the axis
+    double min_proj = std::numeric_limits<double>::max(),
+           max_proj = std::numeric_limits<double>::min();
+    // perpendicular to it
+    double min_perp = std::numeric_limits<double>::max(),
+           max_perp = std::numeric_limits<double>::min();
 
     for (int r = 0; r < labels.rows; r++)
     {
@@ -452,6 +457,99 @@ std::vector<TrainingExample> load_training_examples(const std::string& path)
 }
 
 /*
+    Compute the per-feature standard deviation across all training examples.
+    Used to scale the Euclidean distance so each feature contributes
+    proportionally to its natural spread.
+
+    @param examples loaded training database
+    @return vector of standard deviations, one per feature
+*/
+std::vector<double> compute_feature_std_devs(const std::vector<TrainingExample>& training_examples)
+{
+    if (training_examples.empty())
+    {
+        return {};
+    }
+
+    size_t num_features = training_examples[0].features.size();
+    std::vector<double> means(num_features, 0.0);
+    std::vector<double> result(num_features, 0.0);
+
+    // mean of each feature
+    for (const auto& te : training_examples)
+    {
+        for (size_t i = 0; i < num_features; i++)
+        {
+            means[i] += te.features[i];
+        }
+    }
+    for (double& mean : means)
+        mean /= training_examples.size();
+
+    // variance, then standard deviation of each feature
+    for (const auto& te : training_examples)
+    {
+        for (size_t i = 0; i < num_features; i++)
+        {
+            double difference = te.features[i] - means[i];
+            result[i] += difference * difference;
+        }
+    }
+    for (double& s : result)
+    {
+        s = std::sqrt(s / training_examples.size());
+    }
+
+    return result;
+}
+
+/*
+    Classify a feature vector by nearest neighbor under scaled Euclidean distance.
+
+    @param feature_vector object's feature vector
+    @param training_examples training database's training examples
+    @param std_devs per-feature standard deviations (from compute_feature_std_devs)
+    @param unknown_threshold the threshold at which or exceeding an object will be labeled "unknown"
+    @return label of the nearest example, or "unknown" if DB is empty or no strong match
+*/
+std::string classify(const std::vector<double>& feature_vector,
+                     const std::vector<TrainingExample>& training_examples,
+                     const std::vector<double>& std_devs, const double unknown_treshold = 3.0)
+{
+    std::string result = "";
+    double closest_distance = std::numeric_limits<double>::max();
+
+    for (const auto& training_example : training_examples)
+    {
+        if (training_example.features.size() != feature_vector.size())
+            continue;
+
+        double sum = 0.0;
+        for (size_t i = 0; i < feature_vector.size(); i++)
+        {
+            // 1e-9 is a popular epsilon value due to precison errors
+            double s = (i < std_devs.size() && std_devs[i] > 1e-9) ? std_devs[i] : 1.0;
+            double difference = (feature_vector[i] - training_example.features[i]) / s;
+            sum += difference * difference;
+        }
+        double distance = std::sqrt(sum);
+
+        if (distance < closest_distance)
+        {
+            closest_distance = distance;
+            result = training_example.label;
+        }
+    }
+
+    if (closest_distance > unknown_treshold)
+    {
+        result = "unknown";
+    }
+
+    return result;
+}
+
+/*
     Program entry point.
 
     @param argc argument count with how many command line arguments provided
@@ -459,7 +557,6 @@ std::vector<TrainingExample> load_training_examples(const std::string& path)
     @return exit status / return code sent back to OS
 */
 int main(int argc, char* argv[])
-
 {
     // open video device
     cv::VideoCapture video_capture(0);
@@ -489,6 +586,9 @@ int main(int argc, char* argv[])
     const int min_region_area =
         static_cast<int>(0.0025 * video_capture.get(cv::CAP_PROP_FRAME_WIDTH) *
                          video_capture.get(cv::CAP_PROP_FRAME_HEIGHT));
+
+    std::vector<TrainingExample> training_db = load_training_examples("data/object_db.csv");
+    std::vector<double> feature_std_devs = compute_feature_std_devs(training_db);
 
     cv::Mat frame;
 
@@ -527,34 +627,50 @@ int main(int argc, char* argv[])
         cv::Mat region_map;
         color_regions(region_labels, region_map, max_regions);
 
+        // draw features
         cv::Mat features = frame.clone();
         std::vector<std::vector<double>> frame_vectors; // this frame's vectors
         std::vector<RegionFeatures> frame_features;     // this frame's RegionFeatures
 
+        // feature loop
         for (int i = 1; i < num_regions; i++) // start at 1 to skip background
         {
-            RegionFeatures f;
-            if (compute_features(region_labels, i + 1, f))
+            RegionFeatures region_features;
+            if (compute_features(region_labels, i + 1, region_features))
             {
-                draw_features(features, f);
-                frame_features.push_back(f);
+                draw_features(features, region_features);
+                frame_features.push_back(region_features);
 
-                std::vector<double> feature_vector = make_feature_vector(f);
+                std::vector<double> feature_vector = make_feature_vector(region_features);
                 frame_vectors.push_back(feature_vector);
 
+                // classify
+                const double unknown_threshold = 3.0;
+                std::string classification_label =
+                    classify(feature_vector, training_db, feature_std_devs, unknown_threshold);
+
                 // display text
+                cv::putText(features, classification_label,
+                            cv::Point((int)region_features.centroid.x + 10,
+                                      (int)region_features.centroid.y),
+                            cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+
                 std::string id_text = "ID: " + std::to_string(i);
-                cv::putText(features, id_text, cv::Point((int)f.centroid.x + 10, (int)f.centroid.y),
+                cv::putText(features, id_text,
+                            cv::Point((int)region_features.centroid.x + 10,
+                                      (int)region_features.centroid.y + 18),
                             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
 
-                std::string title = "percent_filled, aspect_ratio";
-                cv::putText(features, title,
-                            cv::Point((int)f.centroid.x + 10, (int)f.centroid.y + 18),
+                std::string feature_titles = "percent_filled, aspect_ratio";
+                cv::putText(features, feature_titles,
+                            cv::Point((int)region_features.centroid.x + 10,
+                                      (int)region_features.centroid.y + 36),
                             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
 
-                std::string values = format_feature_vector(feature_vector);
-                cv::putText(features, values,
-                            cv::Point((int)f.centroid.x + 10, (int)f.centroid.y + 36),
+                std::string feature_values = format_feature_vector(feature_vector);
+                cv::putText(features, feature_values,
+                            cv::Point((int)region_features.centroid.x + 10,
+                                      (int)region_features.centroid.y + 54),
                             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
             }
         }
@@ -587,22 +703,28 @@ int main(int argc, char* argv[])
             {
                 std::cout << "No regions to label.\n";
             }
-            for (int i = 0; i < frame_features.size(); i++)
+            else
             {
-                std::cout << "Enter label for region " << (i + 1) << " (blank to skip): ";
-                std::string label;
-                std::getline(std::cin, label);
-
-                if (label.empty())
+                for (int i = 0; i < frame_features.size(); i++)
                 {
-                    std::cout << "Skipped region " << (i + 1) << ".\n";
-                    continue;
-                }
+                    std::cout << "Enter label for region " << (i + 1) << " (blank to skip): ";
+                    std::string label;
+                    std::getline(std::cin, label);
 
-                save_training_example("data/object_db.csv", label, frame_features[i]);
-                std::cout << "Saved '" << label
-                          << "': " << format_feature_vector(make_feature_vector(frame_features[i]))
-                          << "\n";
+                    if (label.empty())
+                    {
+                        std::cout << "Skipped region " << (i + 1) << ".\n";
+                        continue;
+                    }
+
+                    save_training_example("data/object_db.csv", label, frame_features[i]);
+                    std::cout << "Saved '" << label << "': "
+                              << format_feature_vector(make_feature_vector(frame_features[i]))
+                              << "\n";
+                }
+                // reload so new examples take effect immediately
+                training_db = load_training_examples("data/object_db.csv");
+                feature_std_devs = compute_feature_std_devs(training_db);
             }
         }
     }
