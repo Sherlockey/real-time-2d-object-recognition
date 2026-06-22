@@ -222,6 +222,8 @@ struct RegionFeatures
     double angle;              // axis of least central moment in radians
     double percent_filled;     // region area / OBB area. is a rigid transform
     double aspect_ratio;       // OBB longer side / OBB shorter side. is a rigid transform
+    double hu1;                // first Hu moment (log-scaled)
+    double hu2;                // second Hu moment (log-scaled)
     cv::Point2f box_points[4]; // OBB corners
 };
 
@@ -244,6 +246,16 @@ bool compute_features(const cv::Mat& labels, int region_id, RegionFeatures& out)
     {
         return false; // empty region
     }
+
+    // get Hu moments from moments
+    double hu[7];
+    cv::HuMoments(moments, hu);
+
+    // helper lambda to log scale the hu moments
+    auto log_scale = [](double h)
+    { return (h == 0.0) ? 0.0 : std::copysign(std::log10(std::abs(h)), h); };
+    out.hu1 = log_scale(hu[0]);
+    out.hu2 = log_scale(hu[1]);
 
     // centroid from raw moments
     out.centroid = cv::Point2d(moments.m10 / moments.m00, moments.m01 / moments.m00);
@@ -412,10 +424,10 @@ void save_training_example(const std::string& path, const std::string& label,
 
     if (empty)
     {
-        file << "label,percent_filled,aspect_ratio\n";
+        file << "label,percent_filled,aspect_ratio,hu1,hu2\n";
     }
 
-    file << label << "," << rf.percent_filled << "," << rf.aspect_ratio << "\n";
+    file << label << "," << rf.percent_filled << "," << rf.aspect_ratio << rf.hu1 << rf.hu2 << "\n";
 }
 
 /*
@@ -742,17 +754,17 @@ int main(int argc, char* argv[])
                                       (int)region_features.centroid.y + 18),
                             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
 
-                std::string feature_titles = "percent_filled, aspect_ratio";
-                cv::putText(features, feature_titles,
-                            cv::Point((int)region_features.centroid.x + 10,
-                                      (int)region_features.centroid.y + 36),
-                            cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                // std::string feature_titles = "percent_filled, aspect_ratio";
+                // cv::putText(features, feature_titles,
+                //             cv::Point((int)region_features.centroid.x + 10,
+                //                       (int)region_features.centroid.y + 36),
+                //             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
 
-                std::string feature_values = format_feature_vector(feature_vector);
-                cv::putText(features, feature_values,
-                            cv::Point((int)region_features.centroid.x + 10,
-                                      (int)region_features.centroid.y + 54),
-                            cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                // std::string feature_values = format_feature_vector(feature_vector);
+                // cv::putText(features, feature_values,
+                //             cv::Point((int)region_features.centroid.x + 10,
+                //                       (int)region_features.centroid.y + 54),
+                //             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
             }
         }
 
