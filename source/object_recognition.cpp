@@ -6,6 +6,7 @@
 */
 
 #include "k_means.hpp"
+#include <opencv2/imgproc.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
 
@@ -213,6 +214,168 @@ void color_regions(const cv::Mat& labels, cv::Mat& dst, int max_regions)
     }
 }
 
+struct RegionFeatures
+{
+    cv::Point2d centroid;      // region center of mass (x, y)
+    double angle;              // axis of least central moment in radians
+    double percent_filled;     // region area / OBB area. is a rigid transform
+    double aspect_ratio;       // OBB longer side / OBB shorter side. is a rigid transform
+    cv::Point2f box_points[4]; // OBB corners
+};
+
+/*
+    Compute features for a given region in a label map.
+
+    @param labels    CV_32S label map
+    @param region_id the label value of the region to analyze
+    @param out       output features
+    @return          true if the region had pixels, false otherwise
+*/
+bool compute_features(const cv::Mat& labels, int region_id, RegionFeatures& out)
+{
+    // build a binary mask of just this region using == operator to perform element-wise comparison
+    cv::Mat mask = (labels == region_id);
+
+    // get moments from region
+    cv::Moments moments = cv::moments(mask, true);
+    if (moments.m00 <= 0)
+    {
+        return false; // empty region
+    }
+
+    // centroid from raw moments
+    out.centroid = cv::Point2d(moments.m10 / moments.m00, moments.m01 / moments.m00);
+
+    // axis of least central moment from second-order central moments
+    out.angle = 0.5 * std::atan2(2.0 * moments.mu11, moments.mu20 - moments.mu02);
+
+    // project all region pixels onto the axis and its perpendicular to get
+    // the oriented bounding box extents
+    double cos = std::cos(out.angle);
+    double sin = std::sin(out.angle);
+
+    double min_proj = 1e18, max_proj = -1e18; // along the axis
+    double min_perp = 1e18, max_perp = -1e18; // perpendicular to it
+
+    for (int r = 0; r < labels.rows; r++)
+    {
+        const int* row = labels.ptr<int>(r);
+        for (int c = 0; c < labels.cols; c++)
+        {
+            if (row[c] != region_id)
+                continue;
+
+            double dx = c - out.centroid.x;
+            double dy = r - out.centroid.y;
+
+            double proj = dx * cos + dy * sin;  // distance along axis
+            double perp = -dx * sin + dy * cos; // distance perpendicular
+
+            if (proj < min_proj)
+            {
+                min_proj = proj;
+            }
+            if (proj > max_proj)
+            {
+                max_proj = proj;
+            }
+            if (perp < min_perp)
+            {
+                min_perp = perp;
+            }
+            if (perp > max_perp)
+            {
+                max_perp = perp;
+            }
+        }
+    }
+
+    double height = max_proj - min_proj; // extent along the axis
+    double width = max_perp - min_perp;  // extent perpendicular
+
+    // percent filled = region area divided by OBB area
+    double bbox_area = height * width;
+    out.percent_filled = (bbox_area > 0) ? (moments.m00 / bbox_area) : 0.0;
+
+    // aspect ratio = longer side / shorter side (to ensure rotation invariant)
+    out.aspect_ratio =
+        (width > 0 && height > 0) ? (std::max(height, width) / std::min(height, width)) : 0.0;
+
+    // compute the four OBB corners (in order) for drawing
+
+    // helper lambda to convert to image coordinates
+    auto to_image = [&](double proj, double perp)
+    {
+        double x = out.centroid.x + proj * cos - perp * sin;
+        double y = out.centroid.y + proj * sin + perp * cos;
+        return cv::Point2f((float)x, (float)y);
+    };
+
+    out.box_points[0] = to_image(min_proj, min_perp);
+    out.box_points[1] = to_image(min_proj, max_perp);
+    out.box_points[2] = to_image(max_proj, max_perp);
+    out.box_points[3] = to_image(max_proj, min_perp);
+
+    return true;
+}
+
+/*
+    Draw the oriented bounding box and primary axis for a region's features
+    onto a color image.
+
+    @param dst BGR image to draw on
+    @param region_features the region's features
+*/
+void draw_features(cv::Mat& dst, const RegionFeatures& rf)
+{
+    // draw OBB
+    for (int i = 0; i < 4; i++)
+    {
+        cv::line(dst, rf.box_points[i], rf.box_points[(i + 1) % 4], cv::Scalar(255, 0, 0), 2);
+    }
+
+    // draw primary axis
+    double axis_len = 60.0;
+    cv::Point2d p1(rf.centroid.x - axis_len * std::cos(rf.angle),
+                   rf.centroid.y - axis_len * std::sin(rf.angle));
+    cv::Point2d p2(rf.centroid.x + axis_len * std::cos(rf.angle),
+                   rf.centroid.y + axis_len * std::sin(rf.angle));
+    cv::line(dst, p1, p2, cv::Scalar(0, 255, 0), 2);
+}
+
+/*
+    Pack a region's translation, scale, and rotation invariant features into a vector.
+
+    @param f computed region features
+    @return feature vector [percent_filled, aspect_ratio]
+*/
+std::vector<double> make_feature_vector(const RegionFeatures& f)
+{
+    return {f.percent_filled, f.aspect_ratio};
+}
+
+/*
+    Format a feature vector for display.
+
+    @param fv feature vector
+    @return formatted string"
+*/
+std::string format_feature_vector(const std::vector<double>& fv)
+{
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3) << "[";
+    for (size_t i = 0; i < fv.size(); i++)
+    {
+        oss << fv[i];
+        if (i + 1 < fv.size())
+        {
+            oss << ", ";
+        }
+    }
+    oss << "]";
+    return oss.str();
+}
+
 /*
     Program entry point
 
@@ -243,6 +406,9 @@ int main(int argc, char* argv[])
 
     cv::namedWindow("Region Map", 1);
     cv::moveWindow("Region Map", original_rect.width * 3, 0);
+
+    cv::namedWindow("Features", 1);
+    cv::moveWindow("Features", 0, original_rect.height);
 
     const int min_region_area =
         static_cast<int>(0.0025 * video_capture.get(cv::CAP_PROP_FRAME_WIDTH) *
@@ -285,17 +451,53 @@ int main(int argc, char* argv[])
         cv::Mat region_map;
         color_regions(region_labels, region_map, max_regions);
 
+        cv::Mat features = frame.clone();
+        std::vector<std::vector<double>> frame_vectors; // this frame's vectors
+        for (int i = 1; i < num_regions; i++)
+        {
+            RegionFeatures f;
+            if (compute_features(region_labels, i + 1, f))
+            {
+                draw_features(features, f);
+
+                // make feature vectors
+                std::vector<double> feature_vector = make_feature_vector(f);
+                frame_vectors.push_back(feature_vector);
+
+                // display text
+                std::string title = "percent_filled, aspect_ratio";
+                cv::putText(features, title,
+                            cv::Point((int)f.centroid.x - 10, (int)f.centroid.y - 10),
+                            cv::FONT_HERSHEY_COMPLEX, 0.45, cv::Scalar(255, 255, 255), 1);
+
+                std::string values = format_feature_vector(feature_vector);
+                cv::putText(features, values,
+                            cv::Point((int)f.centroid.x + 10, (int)f.centroid.y + 10),
+                            cv::FONT_HERSHEY_COMPLEX, 0.45, cv::Scalar(255, 255, 255), 1);
+            }
+        }
+
         // display
         cv::imshow("Original Video", frame);
         cv::imshow("Thresholded Video", thresholded);
         cv::imshow("Cleaned Video", cleaned);
         cv::imshow("Region Map", region_map);
+        cv::imshow("Features", features);
 
         // handle input
         char key = cv::pollKey();
         if (key == 'q' || key == 27) // 27 = escape
         {
             should_quit = true;
+        }
+        if (key == 'p') // print feature vectors for the report
+        {
+            std::cout << "feature vectors: percent_filled, aspect_ratio\n";
+            for (size_t i = 0; i < frame_vectors.size(); i++)
+            {
+                std::cout << "    region " << (i + 1) << ": "
+                          << format_feature_vector(frame_vectors[i]) << "\n";
+            }
         }
     }
 
