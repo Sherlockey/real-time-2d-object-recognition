@@ -369,7 +369,7 @@ void draw_features(cv::Mat& dst, const RegionFeatures& rf)
 */
 std::vector<double> make_feature_vector(const RegionFeatures& f)
 {
-    return {f.percent_filled, f.aspect_ratio};
+    return {f.percent_filled, f.aspect_ratio, f.hu1, f.hu2};
 }
 
 /*
@@ -427,7 +427,8 @@ void save_training_example(const std::string& path, const std::string& label,
         file << "label,percent_filled,aspect_ratio,hu1,hu2\n";
     }
 
-    file << label << "," << rf.percent_filled << "," << rf.aspect_ratio << rf.hu1 << rf.hu2 << "\n";
+    file << label << "," << rf.percent_filled << "," << rf.aspect_ratio << "," << rf.hu1 << ","
+         << rf.hu2 << "\n";
 }
 
 /*
@@ -748,7 +749,7 @@ int main(int argc, char* argv[])
                                       (int)region_features.centroid.y),
                             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
 
-                std::string id_text = "ID: " + std::to_string(i);
+                std::string id_text = "ID: " + std::to_string(i + 1);
                 cv::putText(features, id_text,
                             cv::Point((int)region_features.centroid.x + 10,
                                       (int)region_features.centroid.y + 18),
@@ -811,9 +812,7 @@ int main(int argc, char* argv[])
                     }
 
                     save_training_example("data/object_db.csv", label, frame_features[i]);
-                    std::cout << "Saved '" << label << "': "
-                              << format_feature_vector(make_feature_vector(frame_features[i]))
-                              << "\n";
+                    std::cout << "Saved '" << label << "'\n";
                 }
                 // reload so new examples take effect immediately
                 training_db = load_training_examples("data/object_db.csv");
