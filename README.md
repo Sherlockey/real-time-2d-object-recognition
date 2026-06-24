@@ -1,1 +1,12 @@
-- Jonathon Davis
+- Name: Jonathon Davis
+- YouTube video link: https://youtu.be/fYBZKO4aVjs
+- Operating System: Windows 11
+- IDE: Zed
+- Instructions for running executables: 
+  - Configure: cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_TOOLCHAIN_FILE=C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake
+  - Build: cmake --build build
+  - Run: ./build/object_recognition.exe
+- Instructions for running extensions:
+  - The extensions work as part of the base program. For the extra five objects in the database find them under the Extensions::3-Five-more-objects-in-database heading in the report.
+- Time Travel Days:
+  - Yes. 1 Time Travel Day

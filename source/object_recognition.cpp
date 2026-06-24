@@ -8,9 +8,28 @@
 #include "k_means.hpp"
 #include <fstream>
 #include <limits>
+#include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
+
+// declarations for the utility functions (from utilities.cpp)
+int getEmbedding(cv::Mat& src, cv::Mat& embedding, cv::dnn::Net& net, int debug);
+
+void prepEmbeddingImage(cv::Mat& frame, cv::Mat& embimage, int cx, int cy, float theta, float minE1,
+                        float maxE1, float minE2, float maxE2, int debug);
+
+void print_usage()
+{
+    std::cout << "Usage:\n"
+              << "q - quit\n"
+              << "p - print feature vectors\n"
+              << "n - label and save feature training examples\n"
+              << "b - label and save embedding training example\n"
+              << "c - collect an embedding training example and refresh labels\n"
+              << "e - evaluate current label for confusion matrix\n"
+              << "m - print the confusion matrix\n";
+}
 
 /*
     Pre-process a BGR frame into a single-channel image suited for thresholding.
@@ -224,16 +243,20 @@ struct RegionFeatures
     double aspect_ratio;       // OBB longer side / OBB shorter side. is a rigid transform
     double hu1;                // first Hu moment (log-scaled)
     double hu2;                // second Hu moment (log-scaled)
+    double min_proj;           // min extent along primary axis
+    double max_proj;           // max extent along primary axis
+    double min_perp;           // min extent along secondary axis
+    double max_perp;           // max extent along secondary axis
     cv::Point2f box_points[4]; // OBB corners
 };
 
 /*
     Compute features for a given region in a label map.
 
-    @param labels    CV_32S label map
+    @param labels CV_32S label map
     @param region_id the label value of the region to analyze
-    @param out       output features
-    @return          true if the region had pixels, false otherwise
+    @param out output features
+    @return true if the region had pixels, false otherwise
 */
 bool compute_features(const cv::Mat& labels, int region_id, RegionFeatures& out)
 {
@@ -307,6 +330,11 @@ bool compute_features(const cv::Mat& labels, int region_id, RegionFeatures& out)
             }
         }
     }
+
+    out.min_proj = min_proj;
+    out.max_proj = max_proj;
+    out.min_perp = min_perp;
+    out.max_perp = max_perp;
 
     double height = max_proj - min_proj; // extent along the axis
     double width = max_perp - min_perp;  // extent perpendicular
@@ -497,7 +525,9 @@ std::vector<double> compute_feature_std_devs(const std::vector<TrainingExample>&
         }
     }
     for (double& mean : means)
+    {
         mean /= training_examples.size();
+    }
 
     // variance, then standard deviation of each feature
     for (const auto& te : training_examples)
@@ -535,7 +565,9 @@ std::string classify(const std::vector<double>& feature_vector,
     for (const auto& training_example : training_examples)
     {
         if (training_example.features.size() != feature_vector.size())
+        {
             continue;
+        }
 
         double sum = 0.0;
         for (size_t i = 0; i < feature_vector.size(); i++)
@@ -590,7 +622,7 @@ void print_confusion_matrix(const ConfusionMatrix& cm)
 
     const int w = 12; // column width
 
-    // Header row.
+    // header row
     std::cout << "\n" << std::setw(w) << "true\\pred";
     for (const auto& p : labels)
     {
@@ -598,7 +630,7 @@ void print_confusion_matrix(const ConfusionMatrix& cm)
     }
     std::cout << "\n";
 
-    // One row per true label.
+    // one row per true label
     for (const auto& t : labels)
     {
         std::cout << std::setw(w) << t;
@@ -617,21 +649,27 @@ void print_confusion_matrix(const ConfusionMatrix& cm)
         std::cout << "\n";
     }
 
-    // Overall accuracy.
+    // overall accuracy report
     int correct = 0, total = 0;
     for (const auto& t : labels)
     {
         auto row = cm.counts.find(t);
         if (row == cm.counts.end())
+        {
             continue;
+        }
         for (const auto& p : labels)
         {
             auto cell = row->second.find(p);
             if (cell == row->second.end())
+            {
                 continue;
+            }
             total += cell->second;
             if (t == p)
+            {
                 correct += cell->second;
+            }
         }
     }
     if (total > 0)
@@ -639,6 +677,155 @@ void print_confusion_matrix(const ConfusionMatrix& cm)
         std::cout << "\naccuracy: " << correct << "/" << total << " = " << std::fixed
                   << std::setprecision(3) << (100.0 * correct / total) << "%\n";
     }
+}
+
+/*
+    Produce a ResNet18 embedding for one region by preparing the ROI
+    (rotate-to-axis, crop) and running it through the network.
+
+    @param frame original BGR frame
+    @param rf region features (centroid, angle, extents)
+    @param net loaded ResNet18 network
+    @param out output embedding as a float vector
+    @return true on success
+*/
+bool embed_region(cv::Mat& frame, const RegionFeatures& rf, cv::dnn::Net& net,
+                  std::vector<float>& out)
+{
+    cv::Mat roi;
+
+    prepEmbeddingImage(frame, roi, (int)rf.centroid.x, (int)rf.centroid.y, (float)rf.angle,
+                       (float)rf.min_proj, (float)rf.max_proj, (float)rf.min_perp,
+                       (float)rf.max_perp, 0);
+
+    if (roi.empty())
+    {
+        return false;
+    }
+
+    // the network expects 8UC3
+    cv::Mat embedding;
+    getEmbedding(roi, embedding, net, 0);
+
+    // net.forward() shares the network's internal buffer; flatten to one
+    // continuous row and deep-clone so each stored vector is independent.
+    cv::Mat flat = embedding.reshape(1, 1).clone();
+    out.assign(flat.ptr<float>(0), flat.ptr<float>(0) + flat.total());
+    return (!out.empty());
+}
+
+double cosine_distance(const std::vector<float>& a, const std::vector<float>& b)
+{
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (size_t i = 0; i < a.size() && i < b.size(); i++)
+    {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if (na < 1e-12 || nb < 1e-12)
+    {
+        return 1.0;
+    }
+    return (1.0 - dot / (std::sqrt(na) * std::sqrt(nb)));
+}
+
+struct EmbeddingExample
+{
+    std::string label;
+    std::vector<float> embedding;
+};
+
+/*
+    Append a labeled embedding vector to the embedding database file (CSV).
+    Each line is the label followed by the comma-separated embedding values.
+
+    @param path path to the embedding CSV database
+    @param label object label
+    @param embedding embedding vector to store
+*/
+void save_embedding_example(const std::string& path, const std::string& label,
+                            const std::vector<float>& embedding)
+{
+    std::ofstream file(path, std::ios::app);
+    if (!file)
+    {
+        std::cout << "Could not open embedding DB: " << path << "\n";
+        return;
+    }
+    file << label;
+    for (float vector : embedding)
+    {
+        file << "," << vector;
+    }
+    file << "\n";
+}
+
+/*
+    Load all labeled embedding examples from the embedding database file.
+    Each line is parsed as a label followed by comma-separated float values.
+
+    @param path path to the embedding CSV database
+    @return a vector of all embedding examples
+*/
+std::vector<EmbeddingExample> load_embedding_examples(const std::string& path)
+{
+    std::vector<EmbeddingExample> result;
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line))
+    {
+        if (line.empty())
+        {
+            continue;
+        }
+        EmbeddingExample ex;
+        std::stringstream ss(line);
+        std::string token;
+        std::getline(ss, ex.label, ',');
+        while (std::getline(ss, token, ','))
+        {
+            ex.embedding.push_back(std::stof(token));
+        }
+        result.push_back(ex);
+    }
+    return result;
+}
+
+/*
+    Classify an embedding by nearest neighbor under cosine distance.
+    Returns the label of the closest stored example, or "unknown" if the
+    nearest distance exceeds the threshold (or the database is empty).
+
+    @param embedding the embedding vector to classify
+    @param db database of labeled embedding examples
+    @param unknown_threshold cosine distance above which the result is "unknown"
+    @return label of the nearest example, or "unknown"
+*/
+std::string classify_embedding(const std::vector<float>& embedding,
+                               const std::vector<EmbeddingExample>& db,
+                               double unknown_threshold = 0.15)
+{
+    std::string best = "unknown";
+    double best_dist = std::numeric_limits<double>::max();
+    for (const auto& ex : db)
+    {
+        if (ex.embedding.size() != embedding.size())
+        {
+            continue;
+        }
+        double d = cosine_distance(embedding, ex.embedding);
+        if (d < best_dist)
+        {
+            best_dist = d;
+            best = ex.label;
+        }
+    }
+    if (best_dist > unknown_threshold)
+    {
+        best = "unknown";
+    }
+    return best;
 }
 
 /*
@@ -679,11 +866,25 @@ int main(int argc, char* argv[])
         static_cast<int>(0.0025 * video_capture.get(cv::CAP_PROP_FRAME_WIDTH) *
                          video_capture.get(cv::CAP_PROP_FRAME_HEIGHT));
 
+    // training db setup
     std::vector<TrainingExample> training_db = load_training_examples("data/object_db.csv");
     std::vector<double> feature_std_devs = compute_feature_std_devs(training_db);
 
     ConfusionMatrix confusion_matrix;
     const double unknown_threshold = 0.4;
+
+    // cnn setup
+    std::vector<EmbeddingExample> embedding_db = load_embedding_examples("data/embedding_db.csv");
+    cv::dnn::Net net = cv::dnn::readNet("data/resnet18-v2-7.onnx");
+    if (net.empty())
+    {
+        std::cout << "ERROR: ResNet18 network failed to load from data/resnet18-v2-7.onnx\n";
+        return -1;
+    }
+    bool run_cnn = false;
+    std::vector<std::string> cnn_labels;
+
+    print_usage();
 
     cv::Mat frame;
 
@@ -743,29 +944,38 @@ int main(int argc, char* argv[])
                 std::string classification_label =
                     classify(feature_vector, training_db, feature_std_devs, unknown_threshold);
 
+                // embeddings
+                if (run_cnn)
+                {
+                    std::vector<float> embeddings;
+                    std::string emb_label = "unknown";
+                    if (embed_region(frame, region_features, net, embeddings))
+                    {
+                        emb_label = classify_embedding(embeddings, embedding_db);
+                    }
+                    if ((int)cnn_labels.size() <= i)
+                    {
+                        cnn_labels.resize(i + 1, "unknown");
+                    }
+                    cnn_labels[i] = emb_label;
+                }
+                std::string emb_label = (i < (int)cnn_labels.size()) ? cnn_labels[i] : "unknown";
+
                 // display text
-                cv::putText(features, classification_label,
+                cv::putText(features, "feat: " + classification_label,
                             cv::Point((int)region_features.centroid.x + 10,
                                       (int)region_features.centroid.y),
                             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                cv::putText(features, "cnn:  " + emb_label,
+                            cv::Point((int)region_features.centroid.x + 10,
+                                      (int)region_features.centroid.y + 18),
+                            cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
 
                 std::string id_text = "ID: " + std::to_string(i + 1);
                 cv::putText(features, id_text,
                             cv::Point((int)region_features.centroid.x + 10,
-                                      (int)region_features.centroid.y + 18),
+                                      (int)region_features.centroid.y + 36),
                             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
-
-                // std::string feature_titles = "percent_filled, aspect_ratio";
-                // cv::putText(features, feature_titles,
-                //             cv::Point((int)region_features.centroid.x + 10,
-                //                       (int)region_features.centroid.y + 36),
-                //             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
-
-                // std::string feature_values = format_feature_vector(feature_vector);
-                // cv::putText(features, feature_values,
-                //             cv::Point((int)region_features.centroid.x + 10,
-                //                       (int)region_features.centroid.y + 54),
-                //             cv::FONT_HERSHEY_COMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
             }
         }
 
@@ -775,6 +985,9 @@ int main(int argc, char* argv[])
         cv::imshow("Cleaned Video", cleaned);
         cv::imshow("Region Map", region_map);
         cv::imshow("Features", features);
+
+        // reset so cnn doesn't run every frame (only once when triggered with 'c')
+        run_cnn = false;
 
         // handle input
         char key = cv::pollKey();
@@ -843,9 +1056,41 @@ int main(int argc, char* argv[])
                 }
             }
         }
+        if (key == 'c') // run CNN embedding classification on all regions
+        {
+            run_cnn = true;
+        }
         if (key == 'm') // print the confusion matrix
         {
             print_confusion_matrix(confusion_matrix);
+        }
+        if (key == 'b') // collect an embedding training example and refresh labels
+        {
+            if (frame_features.size() != 1)
+            {
+                std::cout << "Embedding training needs exactly one region (found "
+                          << frame_features.size() << ").\n";
+            }
+            else
+            {
+                std::vector<float> e;
+                if (embed_region(frame, frame_features[0], net, e))
+                {
+                    std::cout << "Enter label for this object: ";
+                    std::string label;
+                    std::getline(std::cin, label);
+                    if (!label.empty())
+                    {
+                        save_embedding_example("data/embedding_db.csv", label, e);
+                        embedding_db = load_embedding_examples("data/embedding_db.csv");
+                        std::cout << "Saved embedding for '" << label << "'\n";
+                    }
+                }
+                else
+                {
+                    std::cout << "Failed to compute embedding.\n";
+                }
+            }
         }
     }
 
